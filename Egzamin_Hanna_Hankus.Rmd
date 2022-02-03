@@ -1,0 +1,842 @@
+---
+title: "Egzamin"
+author: "Hanna Hankus"
+date: "22/01/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(glmnet)
+```
+
+## CEL
+
+Zadaniem jest, wczytanie zbioru `wdbc.csv` zawierającego informacje o pacjentach chorujących na raka piersi. Należy zamodelować zmienną `Diagnosis` oznaczającą typ raka piersi (zmienna przyjmuje wartości: `M` = malignant, `B` = benign).
+
+Po wczytaniu zbioru nalezy dokonać:
+
+ - wstępnej eksploracyjnej analizy danych
+ - wyczyszczenia danych jeśli zachodzi potrzeba (np. braki danych, outliery)
+ - zamodelowania `Diagnosis` klasyczną regresją logistyczną bez regularyzacji oraz dwoma dowolnymi metodami
+ - porównanie 3 modeli i wybór najlepszego - trzeba uzasadznić wybrane kryterium wyboru oraz metodykę.
+
+
+
+```{r}
+wdbc <- read.csv("wdbc.csv", header = TRUE, sep=",")
+head(wdbc)
+str(wdbc)
+```
+- Zmienne `V1-V30` są zakodowane, dlatego summary() nie ma sensu, ponieważ nie można wysnuć wstępnych wniosków na temat m.in. punktów oddalonych. 
+- Zmienne `V1-V30` są numeryczne, więc ok, natomiast `Diagnosis` trzeba zmienić na factor
+
+```{r}
+wdbc$Diagnosis <- as.factor(wdbc$Diagnosis)
+summary(wdbc$Diagnosis)
+```
+- Wstępnie założono, że klasy są wystarczająco zbalansowane
+
+Sprawdzenie czy każdy `ID.number` jest unikalny
+
+```{r}
+length(unique(wdbc$ID.number))
+```
+Sprawdzenie **NA's**
+
+```{r}
+NA_check <- function(x){
+ 
+   NA_df <- matrix(ncol=ncol(x), nrow=1)
+  
+  for(i in 1:ncol(x)) {
+    NA_df[ , i] <- sum(is.na((x[ , i])))
+  }
+  
+  NA_df <- data.frame(NA_df)
+  colnames(NA_df) <- colnames(x)
+  NA_df
+}
+
+NA_check(wdbc)
+```
+
+## EDA
+
+Predyktorów jest sporo, do tego są zakodowane, dlatego nie ma sensu wizualizować relacji 2 zmiennych i więcej. Natomiast histogram dla każdej zmiennej `V` z podziałem na zmienną celu `Diagnosis`, graficznie pokaże różnice między rozkładami wartości zmiennej `Diagnosis` (`B`, `M`) oraz nienormalizując oś Y można wstępnie ocenić czy występują **punkty oddalone**.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, figures-side, fig.show="hold", out.width="50%"}
+
+for (i in 3:ncol(wdbc)) {
+  show(ggplot(wdbc, aes(x= wdbc[,i], fill=Diagnosis)) +
+        geom_histogram()+
+        ggtitle(paste("Histogram dla zmiennej V", i-2, sep="") )+
+        xlab(paste("V", i-2, sep="")) +
+        theme_minimal() +
+        geom_vline(aes(xintercept=median(wdbc[,i][wdbc$Diagnosis == 'M'])), color='blue',
+                   linetype='dashed', size=1, show_guide=T) +
+        geom_vline(aes(xintercept=median(wdbc[,i][wdbc$Diagnosis == 'B'])), color='red',
+                   linetype='dashed', size=1, show_guide=T) +
+        scale_color_manual(name = "mediana", values = c(" " = "black")))
+}
+
+```
+Na podstawie powyższych histogramów dla każdej zmiennej `V`, można zauważyć, że:
+
+- występują punkty oddalone, co zostanie zweryfikowane jeszcze w dalszych krokach
+
+- dla niektórych zmiennych widać wyraźne różnice w położeniach rozkładów (medianach), zwłaszcza dla `V1`, `V3`, `V4`, `V7`, `V8`, `V21`, `V23`, `V24`, `V26`, `V27`, `V28`, co może świasczyć o tym, że będą istotnymi predyktorami w modelu.
+
+
+
+Sprawdzenie czy występuje **współliniowość** wśród zmiennych `V`
+```{r paged.print=FALSE}
+korelacja <- round(cor(wdbc[,3:ncol(wdbc)]), 2)
+as.data.frame(ifelse(korelacja >= 0.7, korelacja, ""))
+```
+- Z powyższej macierzy korelacji Pearsona wynika, że występuje silna współliniowość wśród większości zmiennych `V`.
+- W dalszych krokach zredukuję liczbę zmiennych na podstawie współczynnika VIF
+
+
+Szukanie **puntów oddalonych** z wykorzystaniem IQR dla założenia, że punkt x jest oddalony, gdy:
+$$
+(x < Q_1 - 1.5*IQR) \ \lor \ (x > Q_3 + 1.5*IQR)
+$$
+```{r}
+outliers <- function(x, s, e){
+ 
+  # x = dataframe
+  # s = index of first col to take
+  # e = index of last column to take
+   
+  p <- x
+  
+  for(i in s:e){
+    
+    Q1 <- quantile(p[,i], 0.25, names = FALSE)
+    Q3 <- quantile(p[,i], 0.75, names = FALSE)
+    iqr <- IQR(p[,i])
+    low <- Q1 - iqr*1.5
+    up <- Q3 + iqr*1.5
+    
+    p[,i] <- ((p[,i] < low) | (p[,i] > up))
+  }
+  
+  p <- p %>% mutate(outliers_numb = rowSums(p[,s:e]))
+  x$outliers_numb <- p$outliers_numb
+  
+  tot <- sum(x$outliers_numb)
+  totr <- nrow(x %>% filter(outliers_numb > 0))
+  perc <- (tot*100)/(nrow(x)*ncol(x))
+  percr <- (totr*100)/nrow(x)
+  
+  
+  print(paste("Total number of outliers:", round(tot, 0)))
+  print(paste("% of outliers:", round(perc, 2)))
+  print(paste("Total number of rows with outliers:", round(totr, 0)))
+  print(paste("% of rows with outliers:", round(percr, 2)))
+  
+  print("Rows with outliers:")
+  print(x %>% filter(outliers_numb > 0))
+  
+  return(invisible(x))
+  }
+```
+
+```{r}
+outliers(wdbc, s=3, e=ncol(wdbc))
+```
+
+
+Jak widać na podsumowaniu:
+
+- 30% obserwacji zawiera conajmniej 1 punkt oddalony
+- niektóre obserwacje zawierają nawet ponad 10 punktów oddalonych
+
+Sprawdzenie czy dla mniej rygorystycznego warunku (poniżej) znacznie się zmieni liczba punktów oddalonych
+$$
+(x < Q_1 - 2*IQR) \ \lor \ (x > Q_3 + 2*IQR)
+$$
+```{r echo=FALSE}
+outliers <- function(x, s, e){
+ 
+  # x = dataframe
+  # s = index of first col to take
+  # e = index of last column to take
+   
+  p <- x
+  
+  for(i in s:e){
+    
+    Q1 <- quantile(p[,i], 0.25, names = FALSE)
+    Q3 <- quantile(p[,i], 0.75, names = FALSE)
+    iqr <- IQR(p[,i])
+    low <- Q1 - iqr*2.0
+    up <- Q3 + iqr*2.0
+    
+    p[,i] <- ((p[,i] < low) | (p[,i] > up))
+  }
+  
+  p <- p %>% mutate(outliers_numb = rowSums(p[,s:e]))
+  x$outliers_numb <- p$outliers_numb
+  
+  tot <- sum(x$outliers_numb)
+  totr <- nrow(x %>% filter(outliers_numb > 0))
+  perc <- (tot*100)/(nrow(x)*ncol(x))
+  percr <- (totr*100)/nrow(x)
+  
+  
+  print(paste("Total number of outliers:", round(tot, 0)))
+  print(paste("% of outliers:", round(perc, 2)))
+  print(paste("Total number of rows with outliers:", round(totr, 0)))
+  print(paste("% of rows with outliers:", round(percr, 2)))
+  
+  }
+  
+
+outliers(wdbc, s=3, e=ncol(wdbc))
+  
+```
+- Dla znacznego zwiększenia zakresu występowania punktów oddalonych, nadal 20% obserwacji się klasyfikuje jako outlier
+
+
+Sprawdzenie czy duża liczba punktów oddalonych jest skorelowana ze zmienną celu
+```{r include=FALSE}
+outliers <- function(x, s, e){
+ 
+  # x = dataframe
+  # s = index of first col to take
+  # e = index of last column to take
+   
+  p <- x
+  
+  for(i in s:e){
+    
+    Q1 <- quantile(p[,i], 0.25, names = FALSE)
+    Q3 <- quantile(p[,i], 0.75, names = FALSE)
+    iqr <- IQR(p[,i])
+    low <- Q1 - iqr*1.5
+    up <- Q3 + iqr*1.5
+    
+    p[,i] <- ((p[,i] < low) | (p[,i] > up))
+  }
+  
+  p <- p %>% mutate(outliers_numb = rowSums(p[,s:e]))
+  x$outliers_numb <- p$outliers_numb
+  
+  tot <- sum(x$outliers_numb)
+  totr <- nrow(x %>% filter(outliers_numb > 0))
+  perc <- (tot*100)/(nrow(x)*ncol(x))
+  percr <- (totr*100)/nrow(x)
+  
+  
+  print(paste("Total number of outliers:", round(tot, 0)))
+  print(paste("% of outliers:", round(perc, 2)))
+  print(paste("Total number of rows with outliers:", round(totr, 0)))
+  print(paste("% of rows with outliers:", round(percr, 2)))
+  
+  return(invisible(x))
+  }
+```
+
+
+```{r}
+wdbc <- outliers(wdbc, 3, ncol(wdbc))
+```
+
+```{r message=FALSE, warning=FALSE}
+temp <- wdbc %>% filter(wdbc$outliers_numb > 0)
+dod <- ggplot(temp, aes(outliers_numb, fill = Diagnosis)) + 
+  geom_histogram(binwidth = 1,position = 'dodge')
+fil <- ggplot(temp, aes(outliers_numb, fill = Diagnosis)) + 
+  geom_histogram(binwidth = 1,position = 'fill')
+grid.arrange(dod, fil, ncol=2)
+```
+
+- Wynika z tego, że większość outlierów związana jest z mniej liczną grupą zmiennej `Diagnosis` czyli `M`, co może być nieprzypadkowe
+- Można założyć, że dla więcej niż 7 outlierów w obserwacji zmienna przymuje wartość `M`
+
+
+Utworzenie dodatkowej zmiennej `many_outl` z oznaczeniem dla obserwacji, w których występuje >7 outlierów
+```{r}
+wdbc$many_outl[wdbc$outliers_numb > 7] <- TRUE
+wdbc$many_outl[wdbc$outliers_numb <= 7] <- FALSE
+```
+
+Ze względu na dużą ilość outlierów, zastąpię ich wartości medianą danej zmiennej `V` zamiast je usuwać
+
+
+
+## Data Cleaning
+
+
+### Punkty oddalone
+
+
+Utworzenie funkcji do nadpisywania outlierów w data frame'ach
+```{r}
+outliers_deal <- function(x, s, e, f){
+ 
+  # x = dataframe
+  # s = index of first col to take
+  # e = index of last column to take
+  # f =  method to replace outliers (mean, median, mode)
+  
+  for(i in s:e){
+   
+     val <- f(x[,i])
+    Q1 <- quantile(x[,i], 0.25, names = FALSE)
+    Q3 <- quantile(x[,i], 0.75, names = FALSE)
+    iqr <- IQR(x[,i])
+    low <- Q1 - iqr*1.5
+    up <- Q3 + iqr*1.5
+
+    x[,i] <- ifelse((x[,i] < low) | (x[,i] > up), val, x[,i])
+  }
+  return(invisible(x))
+}
+
+```
+
+Sprawdzenie funkcji
+```{r}
+w <- data.frame(col1 = c(1, 2, 3, 4, 5, 90, 6),
+                col2 = c(13000, 6, 13000, 18000, 13000, 12000, 90000),
+                col3 = c(1, 899, 5, 4, 3, 8, 6))
+w
+w <- outliers_deal(w, 1, 3, median)
+w
+```
+
+Utworzenie nowego dataframe z zastąpionymi punktami oddalonymi i sprawdzenie występowania "nowych" outlierów
+```{r}
+wdbc1 <- outliers_deal(wdbc, 3, ncol(wdbc)-2, median)
+outliers(wdbc1, 3, ncol(wdbc)-2)
+```
+- Zastąpienie punktów oddalonych medianą spowodowało zaklasyfikowanie "nowych" punktów jako outliery
+
+
+Porównanie oryginalnych danych z zastąpionymi przez medianę dla wybranych zmiennych `V`
+```{r}
+identical(wdbc1, wdbc)
+summary(wdbc[,7:10])
+summary(wdbc1[,7:10])
+```
+- Redukcja outlierów wyraźnie zmniejszyła wartości maksymalne zmiennych
+- W ten sposób przygotowane dane zostaną zastosowane do modelowania w drugiej części
+
+
+### Współliniowość
+
+
+Stopniowa redukcja współliniowych zmiennych `V` poprzez wyznaczanie kolejnych współczynników VIF i usuwanie zmiennych dla których jest spełniony warunek:
+$$
+VIF > 5
+$$
+```{r}
+VIF_max <- 5
+wdbc1_V <- wdbc1 %>% select(3:32)
+#nie wiem jak zrobić działającą pętle (?)
+```
+
+```{r}
+s <- lm(formula = V1 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(4:32)
+s <- lm(formula = V2 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(5:32)
+s <- lm(formula = V3 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(6:32)
+s <- lm(formula = V4 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7:32)
+s <- lm(formula = V5 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V6 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,9:32)
+s <- lm(formula = V7 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,10:32)
+s <- lm(formula = V8 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11:32)
+s <- lm(formula = V9 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V10 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V11 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:32)
+s <- lm(formula = V12 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V13 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V14 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V15 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V16 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V17 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V18 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V19 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V20 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V21 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:22,24:32)
+s <- lm(formula = V22 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V23 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:22,24,26:32)
+s <- lm(formula = V24 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V25 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V26 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:22,24,26,27, 29:32)
+s <- lm(formula = V27 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:22,24,26,27,30:32)
+s <- lm(formula = V28 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+wdbc1_V <- wdbc1 %>% select(7,11,12,14:22,24,26,27,31:32)
+s <- lm(formula = V29 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+
+```{r echo=FALSE}
+s <- lm(formula = V30 ~ . , data = wdbc1_V) %>% summary()
+vif_z <- 1 / (1 - s$r.squared)
+ifelse(vif_z > VIF_max, print(c(vif_z, "VIF > 5, zmienna wspołliniowa !")), vif_z)
+```
+Ostateczna postać data frame'a `wdbc1` przygotowana do modelowania:
+```{r}
+colnames(wdbc1_V)
+wdbc1 <- wdbc1 %>% select(2, 7,11,12,14:22,24,26,27,31:34)
+head(wdbc1)
+```
+
+\newpage
+
+# Modelowanie
+
+W ramach pracy zbudowane zostaną 3 modele:
+
+- model 1: klasyczną regresją logistyczną bez regularyzacji
+
+- model 2: regresją krokową
+
+- model 3: regresją logistyczną z regularyzacją Lasso
+
+
+Modele zostaną porównane na podstawie metryk:
+
+- **Accuracy**, ponieważ jest bardzo intuicyjna, mówi o stosunku poprawnie sklasyfikowanych obserwacji do ilości wszystkich klasyfikacji oraz w swojej pracy założyłam, że klasy nie są niezbalansowane
+
+- **F1**, która jest średnią harmoniczną z wartości **recall** oraz **precision** i uwzględnia je równomiernie.
+
+Z punktu widzenia analizowanego problemu, czyli klasyfikacji rodzaju nowotworu pacjenta, metryka **recall** jest ważna ze względu na to, że wskazuje ilu pacjentów z odmianą złośliwą zostało błędnie sklasyfikowanych, natomiast jednocześnie **precision** wskazuje dokładność klasyfikacji i uwzględnia przypadki osób z łagodnym nowotworem, które błędnie zostały uznane za chorych na odmianę złośliwą
+
+
+
+Proces modelowania obejmuje następujące kroki:
+
+- Podział zbioru na **zbiór testowy** oraz **zbiór treningowy** poprzez utworzenie 10 fold'ów
+- Utworzenie podstawowego modelu
+- Redukcja liczby predyktorów do jedynie istotnych na podstawie **p-value**
+- Sprawdzenie separacji klas dla modelu poprzez ich wizualizację na histogramie 
+- Określenie jakości modelu poprzez wznaczenie średnich współczynników **Accuracy** oraz **F1** w walidacji krzyżowej 
+- Te same kroki dla modelu 2 i 3
+- Porównanie metryk między modelami i wybór najlepszego
+
+
+```{r}
+wdbc1 <- wdbc1 %>% mutate(cv_fold = (row_number() - 1) %% 10)
+model1_ACC <- c()
+model1_F1 <- c()
+model2_ACC <- c()
+model2_F1 <- c()
+model3_ACC <- c()
+model3_F1 <- c()
+
+models_summary <- data.frame(matrix(ncol = 3, nrow = 0))
+colnames(models_summary) <- c("model", "ACC", "F1")
+```
+
+
+## Model 1: regresja logistyczna
+
+### Stworzenie podstawowego modelu i sprawdzenie istotności zmiennych
+```{r}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ ., family = binomial(link = "logit"))
+print(summary(model1))
+```
+- Zmienne `V5`, `V9`, `V10`, `V13-17`, `V20`, `V25`, `V29`, `V30` i `many_outl` są nieistotne, więc będą pojedynczo usuwane z modelu od najmniejszej istotności
+
+```{r}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V9 + V12 + V13 + V14 + V15 + V16 + V17 + V18 + V19 + V20 + V22 + V24 + V25 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+itd...
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V9 + V12 + V14 + V15 + V16 + V17 + V18 + V19 + V20 + V22 + V24 + V25 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V9 + V12 + V14 + V15 + V17 + V18 + V19 + V20 + V22 + V24 + V25 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V17 + V18 + V19 + V20 + V22 + V24 + V25 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V17 + V18 + V19 + V20 + V22 + V24 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + V20 + V22 + V24 + V29 + V30 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + V20 + V22 + V24 + V29 + outliers_numb + many_outl, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE, include=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + V20 + V22 + V24 + V29 + outliers_numb, family = binomial(link = "logit"))
+print(summary(model1))
+```
+```{r message=FALSE, warning=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + V22 + V24 + V29 + outliers_numb, family = binomial(link = "logit"))
+print(summary(model1))
+```
+W modelu pozostały jedynie istotne zmienne, jednak z jakiegoś powodu pojawia się ostrtzeżenie "Warning: glm.fit: fitted probabilities numerically 0 or 1 occurred".
+
+
+Wizualizacja separacji grup dla modelu w celu jej oceny i dobrania cutoffu
+```{r}
+model1_pred <- predict(model1, test, type = "response") %>% bind_cols(test %>% select(Diagnosis), preds = .)
+ggplot(model1_pred, aes(x = preds, fill = Diagnosis)) + geom_histogram(binwidth = 0.05) + theme_bw()
+```
+Separacja grup zmiennej celu jest podejrzanie bardzo wyraźna. Cutoff pozstanie = 0.5.
+
+
+### Cross-validation
+
+Poprzez walidację krzyżową **modelu 1** wyznaczono Accuracy oraz F1
+
+```{r message=FALSE, warning=FALSE}
+for (fold in 0:9) {
+  train <- wdbc1 %>% filter(cv_fold != fold) %>% select(-cv_fold)
+  test <- wdbc1 %>% filter(cv_fold == fold) %>% select(-cv_fold)
+  model1 <- glm(data = train, formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + V22 + V24 + V29 + outliers_numb, family = binomial(link = "logit"))
+  model1_pred <- predict(model1, test, type = "response") %>% bind_cols(test %>% select(Diagnosis), preds = .)
+  cut05 <- model1_pred %>% mutate(predicted = ifelse(preds >= 0.5, 'M', 'B')) %>%
+    select(-preds) %>% select(predicted, Diagnosis) %>% 
+    mutate_all(list(~ factor(., levels = c('M', 'B')))) %>% table()
+  model1_ACC[fold] <- sum(diag(cut05)) / sum(cut05)
+  pre <- cut05[1, 1] / sum(cut05[1, ])
+  rec <- cut05[1, 1] / sum(cut05[, 1])
+  model1_F1[fold] <- 2 * pre * rec / (pre + rec)
+}
+
+model_1_summary <- list("model 1", mean(model1_ACC), mean(model1_F1))
+models_summary[1,] <- model_1_summary 
+```
+
+```{r}
+models_summary
+```
+
+## Model 2: regresja krokowa
+
+### Stworzenie modelu regresji krokowej, która dobierze model poprzez minimalizację współczynnika Akaike'go (AIC)
+```{r message=FALSE, warning=FALSE}
+train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold)
+test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold)
+
+null_model <- glm(data = train, formula = Diagnosis ~ 1, family = binomial(link = "logit"))
+full_model <- glm(data = train, formula = Diagnosis ~ ., family = binomial(link = "logit"))
+model2 <- step(full_model, scope = list(lower = null_model, upper = full_model),
+direction = "backward")
+summary(model2)
+```
+W wyniku regresji krokowej, zostały dobrane następujące predyktory: `V5`, `V12`, `V14`, `V15`, `V18`, `V19`, `V20`, `V22`, `V24`, `V29`, `outliers_numb`, z czego zmienna `V20` jest nieistotna na podstawie p-value
+
+
+Wizualizacja separacji grup dla modelu w celu jej oceny i dobrania cutoffu
+```{r}
+model2_pred <- predict(model2, test, type = "response") %>% bind_cols(test %>% select(Diagnosis), preds = .)
+ggplot(model2_pred, aes(x = preds, fill = Diagnosis)) + geom_histogram(binwidth = 0.05) + theme_bw()
+```
+Separacja grup zmiennej celu dla drugiego modelu jest również bardzo wyraźna. Założę cutoff = 0.5.
+
+
+### Cross-validation
+
+Poprzez walidację krzyżową **modelu 2** wyznaczono Accuracy oraz F1
+
+```{r message=FALSE, warning=FALSE}
+for (fold in 0:9) {
+  train <- wdbc1 %>% filter(cv_fold != fold) %>% select(-cv_fold)
+  test <- wdbc1 %>% filter(cv_fold == fold) %>% select(-cv_fold)
+  model2 <- glm(formula = Diagnosis ~ V5 + V12 + V14 + V15 + V18 + V19 + 
+    V20 + V22 + V24 + V29 + outliers_numb, family = binomial(link = "logit"), data = train)
+  model2_pred <- predict(model2, test, type = "response") %>% bind_cols(test %>% select(Diagnosis), preds = .)
+  cut05 <- model2_pred %>% mutate(predicted = ifelse(preds >= 0.5, 'M', 'B')) %>%
+    select(-preds) %>% select(predicted, Diagnosis) %>% 
+    mutate_all(list(~ factor(., levels = c('M', 'B')))) %>% table()
+  model2_ACC[fold] <- sum(diag(cut05)) / sum(cut05)
+  pre <- cut05[1, 1] / sum(cut05[1, ])
+  rec <- cut05[1, 1] / sum(cut05[, 1])
+  model2_F1[fold] <- 2 * pre * rec / (pre + rec)
+}
+
+model_2_summary <- list("model 2", mean(model2_ACC), mean(model2_F1))
+models_summary[2,] <- model_2_summary 
+```
+
+```{r}
+models_summary
+```
+
+Model otrzymany metodą regresji krokowej ma nieco wyższe wartości dla obu metryk oraz przy stosowaniu tego modelu również pojawia się komunikat ostrzegawczy "Warning: glm.fit: fitted probabilities numerically 0 or 1 occurred". Być może świadczy on o wciąż obecnych outlierach w danych. (???)
+
+
+## Model 3: regresja z regularyzacją LASSO z wykorzystaniem pakietu `glmnet`
+
+
+Utworzenie zbiorów treningowych i testowych dla predyktorów (`X`) i zmiennej celu (`Y`)
+```{r}
+Y_train <- wdbc1 %>% filter(cv_fold != 0) %>% select(Diagnosis)
+X_train <- wdbc1 %>% filter(cv_fold != 0) %>% select(-cv_fold) %>% select(-Diagnosis)
+X_train <- as.matrix(X_train)
+Y_test <- wdbc1 %>% filter(cv_fold == 0) %>% select(Diagnosis)
+X_test <- wdbc1 %>% filter(cv_fold == 0) %>% select(-cv_fold) %>% select(-Diagnosis)
+X_test <- as.matrix(X_test)
+```
+
+### Walidacja krzyżowa dla znalezienia optymalnej wartości hiperparametru **lambda**, determinująca siłę penalizacji modelu
+
+Współczynnik **alpha** wynosi 1 dla Lasso. `type.measure = "class"` oznacza, że algorytm będzie korzystał z **misclassification error** czyli 1-ACC
+```{r}
+set.seed(1234)
+model3_cv = cv.glmnet(x= X_train, y=Y_train$Diagnosis, family = "binomial", type.measure = "class", alpha = 1, nfolds = 5, standardize = TRUE)
+plot(model3_cv)
+```
+Na wykresie zostały oznaczone przerywaną linią dwie wartości lambda:
+
+- `lambda.min`, która oznacza minimalny średni błąd sprawdzany krzyżowo,
+
+- `lambda.1se`, która oznacza wartość, dla której błąd walidacji mieści się w zakresie jednego błędu standardowego od minimum
+
+
+Rzut okiem na współczynniki dla lambda.min
+```{r}
+coef(model3_cv, s=model3_cv$lambda.min)
+```
+Rzut okiem na współczynniki dla lambda.1se
+```{r}
+coef(model3_cv, s=model3_cv$lambda.1se)
+```
+Nie jestem pewna czy użyć `lambda.min` czy `lambda.1se`, dlatego dla każdej z osobna zrobię predykcje i porównam metryki
+
+Rzut okiem na klasyfikacje dla `lambda.min`
+```{r}
+model3_pred_lmin<-predict(model3_cv, newx = X_test, s = "lambda.min", standardize = TRUE, type="class")
+head(model3_pred_lmin)
+```
+
+Dodanie kolumny z `Diagnosis` ze zbioru testowego zmiennej celu `Y_test` oraz utworzenie macierzy pomyłek i wyznaczenie współczynników **Accuracy** oraz **F1**
+```{r}
+model3_pred_lmin <- as.data.frame(model3_pred_lmin)
+colnames(model3_pred_lmin) <- "predicted"
+model3_pred_lmin$Diagnosis <- Y_test$Diagnosis
+
+confmatrix_model3 <- model3_pred_lmin %>% mutate_all(list(~ factor(., levels = c('M', 'B')))) %>% table()
+  model3_ACC <- sum(diag(confmatrix_model3)) / sum(confmatrix_model3)
+  pre <- confmatrix_model3[1, 1] / sum(confmatrix_model3[1, ])
+  rec <- confmatrix_model3[1, 1] / sum(confmatrix_model3[, 1])
+  model3_F1 <- 2 * pre * rec / (pre + rec)
+  
+model_3_summary <- list("model 3 z lambda.min", model3_ACC, model3_F1)
+models_summary[3,] <- model_3_summary 
+```
+
+Klasyfikacja  dla `lambda.1se`
+```{r}
+model3_pred_lse<-predict(model3_cv, newx = X_test, s = "lambda.1se", standardize = TRUE, type="class")
+
+model3_pred_lse <- as.data.frame(model3_pred_lse)
+colnames(model3_pred_lse) <- "predicted"
+model3_pred_lse$Diagnosis <- Y_test$Diagnosis
+
+confmatrix_model3 <- model3_pred_lse %>% mutate_all(list(~ factor(., levels = c('M', 'B')))) %>% table()
+  model3_ACC <- sum(diag(confmatrix_model3)) / sum(confmatrix_model3)
+  pre <- confmatrix_model3[1, 1] / sum(confmatrix_model3[1, ])
+  rec <- confmatrix_model3[1, 1] / sum(confmatrix_model3[, 1])
+  model3_F1 <- 2 * pre * rec / (pre + rec)
+  
+model_3_summary <- list("model 3 z lambda.1se", model3_ACC, model3_F1)
+models_summary[4,] <- model_3_summary 
+```
+
+
+```{r}
+models_summary
+```
+Dla analizowanego przypadku, okazuje się, że nie ma różnicy pomiędzy modelem z zastosowaniem `lambda.min` i `lambda.1se`. Co ciekawe, dla modelu z regularyzacją Lasso otrzymano nieco gorsze metryki `Accuracy` i `F1` niż dla regresji krokowej.
+
+
+# WNIOSKI
+
+  W niniejszej pracy zostały utworzone 3 modele bazujące na regresji logistycznej, z czego każdy inną metodą. 
+
+  W pierwszej części przeprowadzono eksploracyjną analizę danych w celu sprawdzenia czy klasy w zmiennej celu są względnie zbalansowane, czy w zbiorze nie ma brakujących danych oraz czy pojawiają się outliery. Następnie "oczyszczono" dane poprzez dodanie kolumny z liczbą outlierów w każdej obserwacji oraz zastępując punkty oddalone medianami dla każdej zmiennej `V`. Nie usunięto punktów oddalonych, ponieważ występowały one w około 30% obserwacji, byłaby to olbrzymia strata informacji oraz w przypadku analizowanego zagadnienia, tego typu anomalie są uzasadnione. Pod koniec, sprawdzono współliniowość Wśród zmiennych `V` i na podstawie współczynnika `VIF` zredukowano liczbę tych predyktorów z 30 do 17 (nie licząc zmiennych dodanych w trakcie analizy).
+
+  W drugiej części, zaproponowano klasyczny model regresji logistycznej, w którym optymalizowano liczbę predyktorów poprzez stopniowe usuwanie zmiennych o najmniejszej istotności. W ten sposób pozostawiono jedynie predyktory o p-value>0.05. Histogram dla tego modelu pokazał, że separacja klas zmiennej celu jest bardzo wyraźna i gdyby nie fakt, że przeprowadzono walidację krzyżową, możnaby podejrzewać, że doszło do overfittingu. Jednak ze względu na przeprowadzoną cross-validation, zakładam, że model jest stabilny i wyznaczone metryki (ACC = 0.9648, F1 = 0.9517) nie są zawyżone i wskazują na wysoką dokładność klasyfikacji modelu. Drugi model zbudowano z wykorzystaniem regresji krokowej, która stopniowo usuwała predyktory z "pełnego" modelu i minimalizując współczynnik Akaike'go (AIC) znalazła optymalne zmienne dla klasyfikatora. W walidacji krzyżowej, wyznaczono metryki ACC = 0.9668 i F1 = 0.9533, co świadczy o większej nieco dokładności modelu. Ostatni model zbudowano wykorzystując regularyzację Lasso. W walidacji krzyżowej znaleziono optymalne wartości `lambda` oraz porównano dwie predykcje z wykorzystaniem `lambda.min` oraz `lambda.1se`, ponieważ nie było pewności który współczynnik wykorzystać. Dla obu metryki były takie same i wynosiły: ACC = 0.9649 i F1 = 0.9474. Są to wartości nieco gorsze niż dla modelu 2. Teoretycznie model z regularyzacją powinien być najdokładniejszy. Otrzymane wyniki mogą wynikać z faktu, że zbudowano go na "przerobionych" danych. Być może gdyby został zbudowany na danych surowych bez wcześniejszej manipulacji, byłby lepiej dopasowany. Być może po drodze także zostały popełnione błędy wynikające z faktu, że korzystano poraz pierwszy z pakietu `glmnet` oraz samo modelowanie z regularyzacją Lasso nie jest jeszcze dla mnie tak oczywiste jak poprzednie metody.
+
+  Podsumowując, wybrano model 2 z regresją krokową jako **najlepszy** klasyfikator, ponieważ ma najwyższe wybrane metryki oraz jest dla mniej najbardziej zrozumiały. Nawet gdyby model 3 z regularyzacją Lasso miał najkorzystniejsze metryki, nie zastosowałabym go jako klasyfikator, ponieważ mam wątpliowści co do jego budowy i działania.
